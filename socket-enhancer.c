@@ -46,9 +46,11 @@ struct socket_enhancer_config {
 	uint8_t has_v6_default:1;
 	uint8_t has_v6_v4mapv6:1;
 	uint8_t has_v6_linklocal:1;
+	uint8_t has_v6_uniquelocal:1;
 	struct ipv6_with_scope ipv6_default;
 	struct ipv6_with_scope ipv6_v4mapv6;
 	struct ipv6_with_scope ipv6_linklocal;
+	struct ipv6_with_scope ipv6_uniquelocal;
 };
 static struct socket_enhancer_config *global_config = NULL;
 static void parse_v4(const char *addr, struct in_addr *result) {
@@ -113,6 +115,10 @@ static void socket_enhancer_init(void) {
 				case 0x76346d36: /* "v4m6" */
 					parse_v6(value, &temp_config->ipv6_v4mapv6);
 					temp_config->has_v6_v4mapv6 = 1;
+					break;
+				case 0x76367571: /* "v6uq" */
+					parse_v6(value, &temp_config->ipv6_uniquelocal);
+					temp_config->has_v6_uniquelocal = 1;
 					break;
 				case 0x7636756c: /* "v6ul" */
 					option_numeric_value = strtoul(value, NULL, 0);
@@ -236,6 +242,12 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 					tmp_addr.address.s6_addr16[5] = 0xffff;
 					tmp_addr.address.s6_addr32[3] = *(uint32_t *) &config->ipv4_default;
 					bind_addr = &tmp_addr;
+				}
+			} else if ((new_addr.ipv6_addr.sin6_addr.s6_addr[0] & 0xfe) == 0xfc) {
+				if (config->has_v6_uniquelocal) {
+					bind_addr = &config->ipv6_uniquelocal;
+				} else if (config->has_v6_default) {
+					bind_addr = &config->ipv6_default;
 				}
 			} else {
 				if (config->has_v6_default) {
