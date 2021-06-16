@@ -203,6 +203,10 @@ static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_add
 	return config->real_bind(fd, (struct sockaddr *) &existing_address, sizeof(existing_address));
 }
 int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
+	if (!addr_) {
+		errno = EFAULT;
+		return -1;
+	}
 	const struct sockaddr *addr = addr_;
 	socklen_t len = len_;
 	union {
@@ -273,6 +277,10 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 	return config->real_connect(fd, addr, len);
 }
 int bind(int fd, const struct sockaddr *addr_, socklen_t len_) {
+	if (!addr_) {
+		errno = EFAULT;
+		return -1;
+	}
 	struct socket_enhancer_config *config = __atomic_load_n(&global_config, __ATOMIC_SEQ_CST);
 	if (!config) abort();
 	int always_freebind = !!(config->always_freebind & 1);
