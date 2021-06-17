@@ -22,7 +22,8 @@ static int parse_ipv6_with_scope(char *str, struct ipv6_with_scope *result) {
 			index = strtoul(interface_name, NULL, 0);
 		} else {
 			index = if_nametoindex(interface_name);
-			if (!index) return -1;
+			/* index = 0 on failure, which fails gracefully */
+//			if (!index) return -1;
 		}
 		struct in6_addr res_addr = {0};
 		if (inet_pton(AF_INET6, str, &res_addr) != 1) return -1;
@@ -230,7 +231,7 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 				}
 				if (config->has_v6_linklocal) {
 					bind_addr = &config->ipv6_linklocal;
-					if (IN6_IS_ADDR_UNSPECIFIED(&bind_addr->address) && bind_addr->scope_id) {
+					if (IN6_IS_ADDR_UNSPECIFIED(&bind_addr->address)) {
 						if (!new_addr.ipv6_addr.sin6_scope_id) {
 							new_addr.ipv6_addr.sin6_scope_id = bind_addr->scope_id;
 						}
