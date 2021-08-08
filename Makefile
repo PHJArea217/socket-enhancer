@@ -1,7 +1,7 @@
 all: socket-enhancer
 
 socket-enhancer: socket-enhancer.c
-	gcc -shared -fstack-protector-strong -o socket-enhancer socket-enhancer.c -fPIC -ldl -Wall -Wextra -Wl,-z,relro,-z,now
+	$(CC) -shared -fstack-protector-strong -o socket-enhancer socket-enhancer.c -fPIC -ldl -Wall -Wextra -Wl,-z,relro,-z,now
 clean:
 	rm -f socket-enhancer
 
