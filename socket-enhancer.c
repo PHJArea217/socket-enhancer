@@ -402,6 +402,7 @@ static int try_preconnect_bind_v4(int fd, const struct in_addr *bind_addr, int f
 			if (apply_bind_profile(fd, 44, 0, config, 0) < 0) return -1;
 		}
 	}
+	if (!bind_addr) return 0;
 	int one = 1;
 	setsockopt(fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one));
 	one = 1;
@@ -424,6 +425,7 @@ static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_add
 			if (apply_bind_profile(fd, 64, 0, config, 0) < 0) return -1;
 		}
 	}
+	if (!bind_addr) return 0;
 	int one = 1;
 	setsockopt(fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one));
 	one = 1;
@@ -490,19 +492,17 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 					bind_addr = &config->ipv6_default;
 				}
 			}
-			if (bind_addr) {
-				if (try_preconnect_bind_v6(fd, bind_addr, always_freebind, config)) return -1;
-			}
+			if (try_preconnect_bind_v6(fd, bind_addr, always_freebind, config)) return -1;
 		}
 	} else if (len == sizeof(struct sockaddr_in)) {
 		if (addr->sa_family == AF_INET) {
 			memcpy(&new_addr.ipv4_addr, addr, sizeof(struct sockaddr_in));
 			addr = (struct sockaddr *) &new_addr.ipv4_addr;
 			struct in_addr *v4_address = &new_addr.ipv4_addr.sin_addr;
-			if ((config->has_v4_loopback) && ((ntohl(v4_address->s_addr) & 0xff000000) == 0x7f000000)) {
-				if (try_preconnect_bind_v4(fd, &config->ipv4_loopback, always_freebind, config)) return -1;
-			} else if (config->has_v4_default) {
-				if (try_preconnect_bind_v4(fd, &config->ipv4_default, always_freebind, config)) return -1;
+			if ((ntohl(v4_address->s_addr) & 0xff000000) == 0x7f000000) {
+				if (try_preconnect_bind_v4(fd, config->has_v4_loopback ? &config->ipv4_loopback : NULL, always_freebind, config)) return -1;
+			} else {
+				if (try_preconnect_bind_v4(fd, config->has_v4_default ? &config->ipv4_default : NULL, always_freebind, config)) return -1;
 			}
 		}
 	}
