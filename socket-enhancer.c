@@ -12,6 +12,196 @@ struct ipv6_with_scope {
 	struct in6_addr address;
 	uint32_t scope_id;
 };
+struct bind_profile {
+	uint16_t idx;
+	uint8_t has_if:1;
+	uint8_t has_if_name:1;
+	uint8_t has_fwmark:1;
+	uint8_t set_transparent:1;
+	uint8_t has_bind_address:1;
+	uint32_t fwmark;
+	union {
+		char *ifname;
+		uint32_t ifindex;
+	} bind_interface;
+	struct in6_addr bind_address;
+};
+struct socket_enhancer_config {
+	int (*real_bind)(int, const struct sockaddr *, socklen_t);
+	int (*real_connect)(int, const struct sockaddr *, socklen_t);
+	struct in_addr ipv4_default;
+	struct in_addr ipv4_loopback;
+	uint8_t universal_link_local_mode;
+	uint8_t always_freebind;
+	uint8_t has_v4_default:1;
+	uint8_t has_v4_loopback:1;
+	uint8_t has_v6_default:1;
+	uint8_t has_v6_v4mapv6:1;
+	uint8_t has_v6_linklocal:1;
+	uint8_t has_v6_uniquelocal:1;
+	struct ipv6_with_scope ipv6_default;
+	struct ipv6_with_scope ipv6_v4mapv6;
+	struct ipv6_with_scope ipv6_linklocal;
+	struct ipv6_with_scope ipv6_uniquelocal;
+	struct bind_profile *bind_profile_head;
+	size_t bind_profile_size;
+};
+static int handle_bind_profile(int socket_fd, const struct bind_profile *profile, int do_bind_address, struct socket_enhancer_config *config) {
+	if (profile->has_fwmark) {
+		if (setsockopt(socket_fd, SOL_SOCKET, SO_MARK, &profile->fwmark, sizeof(uint32_t))) return -1;
+	}
+	if (profile->set_transparent) {
+		int one = 1;
+		if (setsockopt(socket_fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one))) {
+			return -1;
+		}
+	}
+	if (profile->has_if) {
+		if (profile->has_if_name) {
+			if (setsockopt(socket_fd, SOL_SOCKET, SO_BINDTODEVICE, profile->bind_interface.ifname, strlen(profile->bind_interface.ifname) + 1)) {
+				return -1;
+			}
+		} else {
+			if (setsockopt(socket_fd, SOL_SOCKET, SO_BINDTOIFINDEX, &profile->bind_interface.ifindex, sizeof(uint32_t))) {
+				return -1;
+			}
+		}
+	}
+	if (do_bind_address && profile->has_bind_address) {
+		int one = 1;
+		setsockopt(fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one));
+		struct sockaddr_in new_bind_addr = {};
+		struct sockaddr_in6 new_bind_addr6 = {};
+		int sock_type = AF_UNSPEC;
+		socklen_t sock_type_len = sizeof(int);
+		if (getsockopt(socket_fd, SOL_SOCKET, SO_DOMAIN, &sock_type, &sock_type_len)) return -1;
+		if (sock_type_len != sizeof(int)) return -1;
+		switch (sock_type) {
+			case AF_INET:
+				if (IN6_IS_ADDR_V4MAPPED(&profile->bind_address)) {
+					new_bind_addr.sin_family = AF_INET;
+					new_bind_addr.sin_port = 0;
+					new_bind_addr.sin_addr = profile->bind_address.s6_addr32[3];
+					if (config->real_bind(socket_fd, (struct sockaddr *) &new_bind_addr, sizeof(new_bind_addr))) return -1;
+				} else {
+					errno = EADDRNOTAVAIL;
+					return -1;
+				}
+				break;
+			case AF_INET6:
+				new_bind_addr6.sin6_family = AF_INET6;
+				new_bind_addr6.sin6_port = 0;
+				memcpy(&new_bind_addr6.sin6_addr, &profile->bind_address, sizeof(struct in6_addr));
+				if (config->real_bind(socket_fd, (struct sockaddr *) &new_bind_addr6, sizeof(new_bind_addr6))) return -1;
+				break;
+			default:
+				errno = ENOPROTOOPT;
+				return -1;
+		}
+	}
+	return 0;
+}
+static int get_idx_by_address(const struct sockaddr *addr, socklen_t len) {
+	uint32_t ipv4_address = 0;
+	if ((len == sizeof(struct sockaddr_in6)) && (addr->sa_family == AF_INET6)) {
+		const struct sockaddr_in6 *addr6 = (const struct sockaddr_in6 *) addr;
+		if (IN6_IS_ADDR_V4MAPPED(&addr6->sin6_addr)) {
+			ipv4_address = ntohl(addr6->sin6_addr.s6_addr32[3]);
+			goto ipv4;
+#if __BYTE_ORDER == __LITTLE_ENDIAN
+		} else if ((addr6->sin6_addr.s6_addr32[0] == 0x00808ffeU)
+#else
+		} else if ((addr6->sin6_addr.s6_addr32[0] == 0xfe8f8000U)
+#endif
+			&& (addr6->sin6_addr.s6_addr32[1] == 0U) && (addr6->sin6_addr.s6_addr32[2] == 0U) && (addr6->sin6_addr.s6_addr16[6] == 0U)) {
+			uint16_t idxval_r = ntohs(addr6->sin6_addr.s6_addr16[7]);
+			if (idxval_r & 0x8000U) {
+				return idxval_r;
+			}
+		} else if (IN6_IS_ADDR_LINKLOCAL(&addr6->sin6_addr)) return 63;
+		else if (IN6_IS_ADDR_LOOPBACK(&addr6->sin6_addr)) return 61;
+		else return 60;
+	} else if ((len == sizeof(struct sockaddr_in)) && (addr->sa_family == AF_INET)) {
+		const struct sockaddr_in *addr4 = (const struct sockaddr_in *) addr;
+		ipv4_address = ntohl(addr4->sin_addr.s_addr);
+		goto ipv4;
+	}
+	return -1;
+ipv4:
+	if ((ipv4_address & 0xffffc000U) == 0x7fa74000U) {
+		return 0x4000U | (ipv4_address & 0x4000U);
+	} else if ((ipv4_address & 0xff000000U) == 0x7f000000U) {
+		return 41;
+	} else {
+		return 40;
+	}
+}
+static int parse_bind_profile_string(const char *input_string, struct bind_profile *result) {
+	memset(result, 0, sizeof(struct bind_profile));
+	char *saveptr = NULL;
+	char *input_string_d = strdup(input_string);
+	if (!input_string_d) return -1;
+	char *idx_str = strtok(input_string_d, "/", &saveptr);
+	if (!idx_str) goto out;
+	unsigned long idx_num = strtoul(idx_str, NULL, 0);
+	if ((idx_num == 0) || (idx_num > 65535)) goto out;
+	result->idx = idx_num;
+	while (1) {
+		char *token = strtok(NULL, "/", &saveptr);
+		if (!token) break;
+		switch (token[0]) {
+			case 'M':
+				if (result->has_fwmark) goto out;
+				errno = 0;
+				unsigned long fwmark = strtoul(&token[1], NULL, 0);
+				if (errno || (fwmark > 4294967295UL)) goto out;
+				result->has_fwmark = 1;
+				result->fwmark = fwmark;
+				break;
+			case 'D':
+				if (result->has_if) goto out;
+				char *ifname = strdup(&token[1]);
+				if (!ifname) goto out;
+				result->bind_interface.ifname = ifname;
+				result->has_if = 1;
+				result->has_if_name = 1;
+				break;
+			case 'I':
+				if (result->has_if) goto out;
+				errno = 0;
+				unsigned long ifindex = strtoul(&token[1], NULL, 0);
+				if (errno || (ifindex > 4294967295UL)) goto out;
+				result->bind_interface.ifindex = ifindex;
+				result->has_if = 1;
+				result->has_if_name = 0;
+				break;
+			case 'T':
+				result->set_transparent = 1;
+				break;
+			case 'B':
+				if (result->has_bind_address) goto out;
+				if (strchr(&token[1], ':')) {
+					if (inet_pton(AF_INET6, &token[1], &result->bind_address) != 1) goto out;
+				} else {
+					result->bind_address.s6_addr32[0] = 0;
+					result->bind_address.s6_addr32[1] = 0;
+					result->bind_address.s6_addr16[4] = 0;
+					result->bind_address.s6_addr16[5] = 0xffffU;
+					if (inet_pton(AF_INET, &token[1], &result->bind_address.s6_addr32[3]) != 1) goto out;
+				}
+				result->has_bind_address = 1;
+				break;
+			default:
+				goto out;
+		}
+	}
+	free(input_string_d);
+	return 0;
+out:
+	if (result->has_if_name) free(result->bind_interface.ifname);
+	free(input_string_d);
+	return -1;
+}
 static int parse_ipv6_with_scope(char *str, struct ipv6_with_scope *result) {
 	char *percent_brk = strchr(str, '%');
 	if (percent_brk) {
@@ -36,24 +226,6 @@ static int parse_ipv6_with_scope(char *str, struct ipv6_with_scope *result) {
 	}
 	return 0;
 }
-struct socket_enhancer_config {
-	int (*real_bind)(int, const struct sockaddr *, socklen_t);
-	int (*real_connect)(int, const struct sockaddr *, socklen_t);
-	struct in_addr ipv4_default;
-	struct in_addr ipv4_loopback;
-	uint8_t universal_link_local_mode;
-	uint8_t always_freebind;
-	uint8_t has_v4_default:1;
-	uint8_t has_v4_loopback:1;
-	uint8_t has_v6_default:1;
-	uint8_t has_v6_v4mapv6:1;
-	uint8_t has_v6_linklocal:1;
-	uint8_t has_v6_uniquelocal:1;
-	struct ipv6_with_scope ipv6_default;
-	struct ipv6_with_scope ipv6_v4mapv6;
-	struct ipv6_with_scope ipv6_linklocal;
-	struct ipv6_with_scope ipv6_uniquelocal;
-};
 static struct socket_enhancer_config *global_config = NULL;
 static void parse_v4(const char *addr, struct in_addr *result) {
 	if (inet_pton(AF_INET, addr, result) != 1) {
