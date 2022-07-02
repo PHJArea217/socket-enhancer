@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <dlfcn.h>
+#include <unistd.h>
 struct ipv6_with_scope {
 	struct in6_addr address;
 	uint32_t scope_id;
@@ -29,6 +30,7 @@ struct bind_profile {
 struct socket_enhancer_config {
 	int (*real_bind)(int, const struct sockaddr *, socklen_t);
 	int (*real_connect)(int, const struct sockaddr *, socklen_t);
+	int (*real_socket)(int, int, int);
 	struct in_addr ipv4_default;
 	struct in_addr ipv4_loopback;
 	uint8_t universal_link_local_mode;
@@ -281,10 +283,13 @@ static void socket_enhancer_init(void) {
 	if (!real_bind_p) abort();
 	void *real_connect_p = dlsym(RTLD_NEXT, "connect");
 	if (!real_connect_p) abort();
+	void *real_socket_p = dlsym(RTLD_NEXT, "socket");
+	if (!real_socket_p) abort();
 	struct socket_enhancer_config *temp_config = calloc(sizeof(struct socket_enhancer_config), 1);
 	if (!temp_config) abort();
 	temp_config->real_bind = real_bind_p;
 	temp_config->real_connect = real_connect_p;
+	temp_config->real_socket = real_socket_p;
 	const char *config_str = getenv("SOCKET_ENHANCER_CONFIG");
 	if (config_str) {
 		char *dup_configstr = strdup(config_str);
@@ -552,4 +557,22 @@ int bind(int fd, const struct sockaddr *addr_, socklen_t len_) {
 		if (r == 1) return 0;
 	}
 	return config->real_bind(fd, addr, len);
+}
+int socket(int domain, int type, int protocol) {
+	struct socket_enhancer_config *config = __atomic_load_n(&global_config, __ATOMIC_SEQ_CST);
+	if (!config) abort();
+	int socket_return = config->real_socket(domain, type, protocol);
+	if (socket_return < 0) return -1;
+	switch (domain) {
+		case AF_INET:
+			if (apply_bind_profile(socket_return, 4, 0, config, 0) < 0) goto out;
+			break;
+		case AF_INET6:
+			if (apply_bind_profile(socket_return, 6, 0, config, 0) < 0) goto out;
+			break;
+	}
+	return socket_return;
+out:
+	close(socket_return);
+	return -1;
 }
