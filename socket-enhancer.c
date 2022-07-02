@@ -39,6 +39,7 @@ struct socket_enhancer_config {
 	uint8_t has_v6_v4mapv6:1;
 	uint8_t has_v6_linklocal:1;
 	uint8_t has_v6_uniquelocal:1;
+	uint8_t has_bp_high:1;
 	struct ipv6_with_scope ipv6_default;
 	struct ipv6_with_scope ipv6_v4mapv6;
 	struct ipv6_with_scope ipv6_linklocal;
@@ -46,7 +47,7 @@ struct socket_enhancer_config {
 	struct bind_profile *bind_profile_head;
 	size_t bind_profile_size;
 };
-static int handle_bind_profile(int socket_fd, const struct bind_profile *profile, int do_bind_address, struct socket_enhancer_config *config) {
+static int handle_bind_profile(int socket_fd, const struct bind_profile *profile, int do_bind_address, uint16_t port, struct socket_enhancer_config *config) {
 	if (profile->has_fwmark) {
 		if (setsockopt(socket_fd, SOL_SOCKET, SO_MARK, &profile->fwmark, sizeof(uint32_t))) return -1;
 	}
@@ -68,8 +69,10 @@ static int handle_bind_profile(int socket_fd, const struct bind_profile *profile
 		}
 	}
 	if (do_bind_address && profile->has_bind_address) {
-		int one = 1;
-		setsockopt(fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one));
+		if (port == 0) {
+			int one = 1;
+			setsockopt(socket_fd, SOL_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one));
+		}
 		struct sockaddr_in new_bind_addr = {};
 		struct sockaddr_in6 new_bind_addr6 = {};
 		int sock_type = AF_UNSPEC;
@@ -80,8 +83,8 @@ static int handle_bind_profile(int socket_fd, const struct bind_profile *profile
 			case AF_INET:
 				if (IN6_IS_ADDR_V4MAPPED(&profile->bind_address)) {
 					new_bind_addr.sin_family = AF_INET;
-					new_bind_addr.sin_port = 0;
-					new_bind_addr.sin_addr = profile->bind_address.s6_addr32[3];
+					new_bind_addr.sin_port = port;
+					new_bind_addr.sin_addr.s_addr = profile->bind_address.s6_addr32[3];
 					if (config->real_bind(socket_fd, (struct sockaddr *) &new_bind_addr, sizeof(new_bind_addr))) return -1;
 				} else {
 					errno = EADDRNOTAVAIL;
@@ -90,7 +93,7 @@ static int handle_bind_profile(int socket_fd, const struct bind_profile *profile
 				break;
 			case AF_INET6:
 				new_bind_addr6.sin6_family = AF_INET6;
-				new_bind_addr6.sin6_port = 0;
+				new_bind_addr6.sin6_port = port;
 				memcpy(&new_bind_addr6.sin6_addr, &profile->bind_address, sizeof(struct in6_addr));
 				if (config->real_bind(socket_fd, (struct sockaddr *) &new_bind_addr6, sizeof(new_bind_addr6))) return -1;
 				break;
@@ -100,6 +103,17 @@ static int handle_bind_profile(int socket_fd, const struct bind_profile *profile
 		}
 	}
 	return 0;
+}
+static int compare_bind_profiles(const void *first, const void *second) {
+	struct bind_profile *a = (struct bind_profile *) first;
+	struct bind_profile *b = (struct bind_profile *) second;
+	if (a->idx < b->idx) return -1;
+	else if (a->idx > b->idx) return 1;
+	else return 0;
+}
+static struct bind_profile *find_bind_profile_by_index(struct socket_enhancer_config *config, uint16_t idx) {
+	struct bind_profile dummy = {.idx = idx};
+	return bsearch(&dummy, config->bind_profile_head, config->bind_profile_size, sizeof(struct bind_profile), compare_bind_profiles);
 }
 static int get_idx_by_address(const struct sockaddr *addr, socklen_t len) {
 	uint32_t ipv4_address = 0;
@@ -136,18 +150,40 @@ ipv4:
 		return 40;
 	}
 }
+static int apply_bind_profile(int socket_fd, uint16_t idx, uint16_t port, struct socket_enhancer_config *config, int do_bind) {
+	struct bind_profile *profile = find_bind_profile_by_index(config, idx);
+	if (profile) {
+		if (handle_bind_profile(socket_fd, profile, do_bind, port, config)) return -1;
+		return 1;
+	}
+	if ((idx >= 16384) && config->has_bp_high) {
+		errno = EADDRNOTAVAIL;
+		return -1;
+	}
+	return 0;
+}
+static int apply_bind_profile_sockname(int socket_fd, const struct sockaddr *addr, socklen_t len, struct socket_enhancer_config *config, int do_bind) {
+	int profile_idx = get_idx_by_address(addr, len);
+	if (profile_idx < 0) return 0;
+	if ((len == sizeof(struct sockaddr_in6)) && (addr->sa_family == AF_INET6)) {
+		return apply_bind_profile(socket_fd, profile_idx, ((struct sockaddr_in6 *) addr)->sin6_port, config, do_bind);
+	} else if ((len == sizeof(struct sockaddr_in)) && (addr->sa_family == AF_INET)) {
+		return apply_bind_profile(socket_fd, profile_idx, ((struct sockaddr_in *) addr)->sin_port, config, do_bind);
+	}
+	return 0;
+}
 static int parse_bind_profile_string(const char *input_string, struct bind_profile *result) {
 	memset(result, 0, sizeof(struct bind_profile));
 	char *saveptr = NULL;
 	char *input_string_d = strdup(input_string);
 	if (!input_string_d) return -1;
-	char *idx_str = strtok(input_string_d, "/", &saveptr);
+	char *idx_str = strtok_r(input_string_d, "/", &saveptr);
 	if (!idx_str) goto out;
 	unsigned long idx_num = strtoul(idx_str, NULL, 0);
 	if ((idx_num == 0) || (idx_num > 65535)) goto out;
 	result->idx = idx_num;
 	while (1) {
-		char *token = strtok(NULL, "/", &saveptr);
+		char *token = strtok_r(NULL, "/", &saveptr);
 		if (!token) break;
 		switch (token[0]) {
 			case 'M':
@@ -304,6 +340,25 @@ static void socket_enhancer_init(void) {
 					if (option_numeric_value > 3) goto out_of_range;
 					temp_config->always_freebind = option_numeric_value;
 					break;
+				case 0x62647072: /* "bdpr" */
+					{
+						struct bind_profile result = {};
+						if (parse_bind_profile_string(value, &result)) {
+							fprintf(stderr, "Invalid bind profile %s\n", value);
+							abort();
+						}
+						size_t newidx = temp_config->bind_profile_size++;
+						void *new_head = reallocarray(temp_config->bind_profile_head, sizeof(struct bind_profile), newidx+1);
+						if (!new_head) {
+							abort();
+						}
+						temp_config->bind_profile_head = new_head;
+						memcpy(&temp_config->bind_profile_head[newidx], &result, sizeof(struct bind_profile));
+						if (result.idx >= 16384) {
+							temp_config->has_bp_high = 1;
+						}
+					}
+					break;
 				default:
 					fprintf(stderr, "Invalid config option %s\n", token);
 					abort();
@@ -316,6 +371,7 @@ out_of_range:
 			return;
 		}
 		free(dup_configstr);
+		qsort(temp_config->bind_profile_head, temp_config->bind_profile_size, sizeof(struct bind_profile), compare_bind_profiles);
 	}
 	__atomic_store_n(&global_config, temp_config, __ATOMIC_SEQ_CST);
 }
@@ -343,6 +399,7 @@ static int try_preconnect_bind_v4(int fd, const struct in_addr *bind_addr, int f
 	if (addrlen == sizeof(struct sockaddr_in)) {
 		if (existing_address.sin_family == AF_INET) {
 			if (*(uint32_t *) &existing_address.sin_addr) return 0;
+			if (apply_bind_profile(fd, 44, 0, config, 0) < 0) return -1;
 		}
 	}
 	int one = 1;
@@ -364,6 +421,7 @@ static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_add
 			if (existing_address.sin6_addr.s6_addr32[1]) return 0;
 			if (existing_address.sin6_addr.s6_addr32[2]) return 0;
 			if (existing_address.sin6_addr.s6_addr32[3]) return 0;
+			if (apply_bind_profile(fd, 64, 0, config, 0) < 0) return -1;
 		}
 	}
 	int one = 1;
@@ -461,6 +519,10 @@ int bind(int fd, const struct sockaddr *addr_, socklen_t len_) {
 	const struct sockaddr *addr = addr_;
 	socklen_t len = len_;
 	struct sockaddr_in6 ipv6_addr = {0};
+	if (always_freebind) {
+		int one = 1;
+		setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one));
+	}
 	if (len == sizeof(struct sockaddr_in6)) {
 		if (addr->sa_family == AF_INET6) {
 			memcpy(&ipv6_addr, addr, sizeof(struct sockaddr_in6));
@@ -468,11 +530,22 @@ int bind(int fd, const struct sockaddr *addr_, socklen_t len_) {
 			if (config->universal_link_local_mode & 1) {
 				convert_universal_linklocal(&ipv6_addr);
 			}
+			int r = apply_bind_profile_sockname(fd, (struct sockaddr *) &ipv6_addr, sizeof(struct sockaddr_in6), config, 1);
+			if (r < 0) {
+				if (errno == 0) errno = EADDRNOTAVAIL;
+				return -1;
+			}
+			if (r == 1) return 0;
 		}
-	}
-	if (always_freebind) {
-		int one = 1;
-		setsockopt(fd, SOL_IP, IP_FREEBIND, &one, sizeof(one));
+	} else if ((len == sizeof(struct sockaddr_in)) && (addr->sa_family == AF_INET)) {
+		struct sockaddr_in ipv4_addr;
+		memcpy(&ipv4_addr, addr, sizeof(struct sockaddr_in));
+		int r = apply_bind_profile_sockname(fd, (struct sockaddr *) &ipv4_addr, sizeof(struct sockaddr_in), config, 1);
+		if (r < 0) {
+			if (errno == 0) errno = EADDRNOTAVAIL;
+			return -1;
+		}
+		if (r == 1) return 0;
 	}
 	return config->real_bind(fd, addr, len);
 }
