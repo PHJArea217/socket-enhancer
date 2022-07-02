@@ -392,14 +392,14 @@ static void convert_universal_linklocal(struct sockaddr_in6 *addr) {
 }
 #endif
 }
-static int try_preconnect_bind_v4(int fd, const struct in_addr *bind_addr, int freebind, struct socket_enhancer_config *config) {
+static int try_preconnect_bind_v4(int fd, const struct in_addr *bind_addr, int freebind, uint16_t bind_profile_idx, struct socket_enhancer_config *config) {
 	struct sockaddr_in existing_address = {0};
 	socklen_t addrlen = sizeof(struct sockaddr_in);
 	if (getsockname(fd, (struct sockaddr *) &existing_address, &addrlen)) return -1;
 	if (addrlen == sizeof(struct sockaddr_in)) {
 		if (existing_address.sin_family == AF_INET) {
 			if (*(uint32_t *) &existing_address.sin_addr) return 0;
-			if (apply_bind_profile(fd, 44, 0, config, 0) < 0) return -1;
+			if (apply_bind_profile(fd, bind_profile_idx, 0, config, 0) < 0) return -1;
 		}
 	}
 	if (!bind_addr) return 0;
@@ -412,7 +412,7 @@ static int try_preconnect_bind_v4(int fd, const struct in_addr *bind_addr, int f
 	memcpy(&existing_address.sin_addr, bind_addr, sizeof(struct in_addr));
 	return config->real_bind(fd, (struct sockaddr *) &existing_address, sizeof(existing_address));
 }
-static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_addr, int freebind, struct socket_enhancer_config *config) {
+static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_addr, int freebind, uint16_t bind_profile_idx, struct socket_enhancer_config *config) {
 	struct sockaddr_in6 existing_address = {0};
 	socklen_t addrlen = sizeof(struct sockaddr_in6);
 	if (getsockname(fd, (struct sockaddr *) &existing_address, &addrlen)) return -1;
@@ -422,7 +422,7 @@ static int try_preconnect_bind_v6(int fd, const struct ipv6_with_scope *bind_add
 			if (existing_address.sin6_addr.s6_addr32[1]) return 0;
 			if (existing_address.sin6_addr.s6_addr32[2]) return 0;
 			if (existing_address.sin6_addr.s6_addr32[3]) return 0;
-			if (apply_bind_profile(fd, 64, 0, config, 0) < 0) return -1;
+			if (apply_bind_profile(fd, bind_profile_idx, 0, config, 0) < 0) return -1;
 		}
 	}
 	if (!bind_addr) return 0;
@@ -457,7 +457,9 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 			struct ipv6_with_scope tmp_addr = {0};
 			memcpy(&new_addr.ipv6_addr, addr, sizeof(struct sockaddr_in6));
 			addr = (struct sockaddr *) &new_addr.ipv6_addr;
+			int bind_profile_idx = 64;
 			if (IN6_IS_ADDR_LINKLOCAL(&new_addr.ipv6_addr.sin6_addr)) {
+				bind_profile_idx = 66;
 				if (config->universal_link_local_mode & 2) {
 					convert_universal_linklocal(&new_addr.ipv6_addr);
 				}
@@ -473,6 +475,7 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 					bind_addr = &config->ipv6_default;
 				}
 			} else if (IN6_IS_ADDR_V4MAPPED(&new_addr.ipv6_addr.sin6_addr)) {
+				bind_profile_idx = 44;
 				if (config->has_v6_v4mapv6) {
 					bind_addr = &config->ipv6_v4mapv6;
 				} else if (config->has_v4_default) {
@@ -482,6 +485,7 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 					bind_addr = &tmp_addr;
 				}
 			} else if ((new_addr.ipv6_addr.sin6_addr.s6_addr[0] & 0xfe) == 0xfc) {
+				bind_profile_idx = 67;
 				if (config->has_v6_uniquelocal) {
 					bind_addr = &config->ipv6_uniquelocal;
 				} else if (config->has_v6_default) {
@@ -492,7 +496,7 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 					bind_addr = &config->ipv6_default;
 				}
 			}
-			if (try_preconnect_bind_v6(fd, bind_addr, always_freebind, config)) return -1;
+			if (try_preconnect_bind_v6(fd, bind_addr, always_freebind, bind_profile_idx, config)) return -1;
 		}
 	} else if (len == sizeof(struct sockaddr_in)) {
 		if (addr->sa_family == AF_INET) {
@@ -500,9 +504,9 @@ int connect(int fd, const struct sockaddr *addr_, socklen_t len_) {
 			addr = (struct sockaddr *) &new_addr.ipv4_addr;
 			struct in_addr *v4_address = &new_addr.ipv4_addr.sin_addr;
 			if ((ntohl(v4_address->s_addr) & 0xff000000) == 0x7f000000) {
-				if (try_preconnect_bind_v4(fd, config->has_v4_loopback ? &config->ipv4_loopback : NULL, always_freebind, config)) return -1;
+				if (try_preconnect_bind_v4(fd, config->has_v4_loopback ? &config->ipv4_loopback : NULL, always_freebind, 45, config)) return -1;
 			} else {
-				if (try_preconnect_bind_v4(fd, config->has_v4_default ? &config->ipv4_default : NULL, always_freebind, config)) return -1;
+				if (try_preconnect_bind_v4(fd, config->has_v4_default ? &config->ipv4_default : NULL, always_freebind, 44, config)) return -1;
 			}
 		}
 	}
