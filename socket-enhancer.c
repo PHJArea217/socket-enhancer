@@ -145,7 +145,7 @@ static int get_idx_by_address(const struct sockaddr *addr, socklen_t len) {
 	return -1;
 ipv4:
 	if ((ipv4_address & 0xffffc000U) == 0x7fa74000U) {
-		return 0x4000U | (ipv4_address & 0x4000U);
+		return 0x4000U | (ipv4_address & 0x3fffU);
 	} else if ((ipv4_address & 0xff000000U) == 0x7f000000U) {
 		return 41;
 	} else {
